@@ -42,7 +42,6 @@ This project now includes an HTTP wrapper service used by `hackathon_prototype_v
 ### Start the wrapper
 
 ```bash
-cd /Users/kotwatu/Development/GitRepos/Services/TestJava/java-vulnerabilities-remover
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
