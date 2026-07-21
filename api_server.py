@@ -26,6 +26,9 @@ from subagents.java_vulnerablility_scanner_agent.tools.tools import (
     clone_repository,
 )
 from subagents.java_vulnerablility_scanner_agent.tools.static_scanner import scan_workspace_static
+from multi_scanner import scan_workspace_multi
+from cross_model_judge import judge_proposals
+from github_pr import create_pull_request, build_pr_body
 
 
 app = FastAPI(title="Java Vulnerabilities Remover ADK Wrapper", version="1.0.0")
@@ -426,6 +429,17 @@ def _scanner_backend() -> str:
         return "static"
 
 
+
+def _maybe_create_github_pr(*, repo_url: str, workspace_path: str, changed_files: list[str], changes: list, run_id: str, findings_count: int):
+    branch = f"auto-remediation-{run_id[:8]}"
+    body = build_pr_body(run_id, findings_count, changes)
+    title = f"[Auto-Remediation] Fix {findings_count} vulnerabilities ({run_id[:8]})"
+    rel_files = []
+    for f in changed_files:
+        rel_files.append(os.path.relpath(f, workspace_path).replace(os.sep, "/") if os.path.isabs(f) else f)
+    return create_pull_request(repo_url=repo_url, workspace_path=workspace_path, changed_files=rel_files, branch_name=branch, title=title, body=body)
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {"status": "ok", "tracked_runs": len(RUN_CONTEXTS), "scanner_backend": _scanner_backend()}
@@ -440,7 +454,7 @@ async def scan(request: ScanRequest) -> dict[str, Any]:
 
     if backend == "static":
         # Offline deterministic scanner - no JFrog CLI or network required.
-        merged = scan_workspace_static(context.workspace_path)
+        merged = scan_workspace_multi(context.workspace_path)
         if merged.get("scan_execution_error") or merged.get("status") == "error":
             raise HTTPException(status_code=400, detail=merged.get("error") or "Static scan failed")
     else:
@@ -482,6 +496,30 @@ async def scan(request: ScanRequest) -> dict[str, Any]:
         "total_vulnerabilities": merged.get("total_vulnerabilities", 0),
         "report_path": merged.get("report_path"),
     }
+
+
+
+@app.post("/judge")
+async def judge(request: PlanRequest) -> dict[str, Any]:
+    """Cross-model judge: a second LLM reviews remediation proposals."""
+    proposals = []
+    for finding in request.findings:
+        recommended = list(finding.get("recommended_versions") or [])
+        preferred = finding.get("fixed_version")
+        to_v = preferred or (recommended[0] if recommended else finding.get("current_version", "unknown"))
+        dep_name = finding.get("dependency", "unknown")
+        cve_name = finding.get("cve", "CVE-unknown")
+        proposals.append({
+            "id": str(uuid4()),
+            "finding_id": finding.get("id") or str(uuid4()),
+            "dependency": dep_name,
+            "from_version": finding.get("current_version", "unknown"),
+            "to_version": to_v,
+            "reasoning": f"Upgrade {dep_name} to {to_v} for {cve_name}",
+            "confidence_score": 0.82,
+        })
+    summary = judge_proposals(proposals, request.findings)
+    return {"proposals": proposals, "judge_review": summary}
 
 
 @app.post("/remediate/plan")
@@ -620,11 +658,11 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
         "changes": changes,
         "diff_excerpt": _diff_excerpt(workspace_path),
         "remediation_result": remediation_result,
-        "pull_request": {
-            "status": "skipped",
-            "url": None,
-            "reason": "PR creation is handled by downstream integration",
-        },
+        "pull_request": _maybe_create_github_pr(
+            repo_url=request.repo_url, workspace_path=workspace_path,
+            changed_files=changed_files, changes=changes,
+            run_id=request.run_id, findings_count=len(request.proposals),
+        ),
     }
 
 
