@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import os
 import json
 import logging
 from pathlib import Path
@@ -19,11 +20,12 @@ from subagents.java_vulnerability_fixer_agent.tools.tools import (
     run_mvn_test,
     update_pom_xml,
 )
-from subagents.java_vulnerability_scanner_agent.agent import java_vulnerability_scanner_agent
-from subagents.java_vulnerability_scanner_agent.tools.tools import (
+from subagents.java_vulnerablility_scanner_agent.agent import java_vulnerability_scanner_agent
+from subagents.java_vulnerablility_scanner_agent.tools.tools import (
     cleanup_workspace,
     clone_repository,
 )
+from subagents.java_vulnerablility_scanner_agent.tools.static_scanner import scan_workspace_static
 
 
 app = FastAPI(title="Java Vulnerabilities Remover ADK Wrapper", version="1.0.0")
@@ -411,9 +413,22 @@ def _map_updated_dependencies(updated_dependencies: list[dict[str, Any]], defaul
     return changes
 
 
+def _scanner_backend() -> str:
+    """Resolve the active scanner backend: 'jf', 'static', or 'auto' (jf if available else static)."""
+    backend = os.getenv("SCANNER_BACKEND", "auto").strip().lower() or "auto"
+    if backend in {"jf", "static"}:
+        return backend
+    # auto: use JFrog CLI if it is installed and reachable, otherwise static fallback.
+    try:
+        probe = subprocess.run(["jf", "--version"], capture_output=True, text=True, timeout=15)
+        return "jf" if probe.returncode == 0 else "static"
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return "static"
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "tracked_runs": len(RUN_CONTEXTS)}
+    return {"status": "ok", "tracked_runs": len(RUN_CONTEXTS), "scanner_backend": _scanner_backend()}
 
 
 @app.post("/scan")
@@ -421,33 +436,43 @@ async def scan(request: ScanRequest) -> dict[str, Any]:
     run_id = request.run_id or str(uuid4())
     context = _ensure_workspace(request.repo_url, run_id)
 
-    state = await _invoke_agent(
-        app_name="java-vulnerability-scan",
-        agent=java_vulnerability_scanner_agent,
-        state={"workspace_url": context.workspace_path, "run_id": run_id, "repo_url": request.repo_url},
-        message=(
-            "Run vulnerability scan for this workspace and return strict JSON only. "
-            f"workspace_url={context.workspace_path}."
-        ),
-    )
-    merged = _coerce_dict(state.get("vulnerability_scan_report"))
-    if not merged:
-        merged = _coerce_dict(state.get("__last_function_response"))
-    if not merged:
-        merged = _coerce_dict(state.get("__last_text_json"))
-    if not merged:
-        raise HTTPException(status_code=502, detail="Scanner ADK agent returned no structured output")
-    if merged.get("scan_execution_error"):
-        raise HTTPException(status_code=502, detail=merged.get("error") or "JFrog scan execution failed")
-    if merged.get("return_code") not in (None, 0) and merged.get("total_vulnerabilities", 0) == 0:
-        raise HTTPException(status_code=502, detail=merged.get("error") or "JFrog scan failed before producing findings")
-    if merged.get("scan_status") == "error" or merged.get("status") == "error":
-        raise HTTPException(status_code=400, detail=merged.get("error") or "Scan failed")
+    backend = _scanner_backend()
+
+    if backend == "static":
+        # Offline deterministic scanner - no JFrog CLI or network required.
+        merged = scan_workspace_static(context.workspace_path)
+        if merged.get("scan_execution_error") or merged.get("status") == "error":
+            raise HTTPException(status_code=400, detail=merged.get("error") or "Static scan failed")
+    else:
+        # JFrog CLI-backed scan via the ADK scanner agent.
+        state = await _invoke_agent(
+            app_name="java-vulnerability-scan",
+            agent=java_vulnerability_scanner_agent,
+            state={"workspace_url": context.workspace_path, "run_id": run_id, "repo_url": request.repo_url},
+            message=(
+                "Run vulnerability scan for this workspace and return strict JSON only. "
+                f"workspace_url={context.workspace_path}."
+            ),
+        )
+        merged = _coerce_dict(state.get("vulnerability_scan_report"))
+        if not merged:
+            merged = _coerce_dict(state.get("__last_function_response"))
+        if not merged:
+            merged = _coerce_dict(state.get("__last_text_json"))
+        if not merged:
+            raise HTTPException(status_code=502, detail="Scanner ADK agent returned no structured output")
+        if merged.get("scan_execution_error"):
+            raise HTTPException(status_code=502, detail=merged.get("error") or "JFrog scan execution failed")
+        if merged.get("return_code") not in (None, 0) and merged.get("total_vulnerabilities", 0) == 0:
+            raise HTTPException(status_code=502, detail=merged.get("error") or "JFrog scan failed before producing findings")
+        if merged.get("scan_status") == "error" or merged.get("status") == "error":
+            raise HTTPException(status_code=400, detail=merged.get("error") or "Scan failed")
 
     return {
         "run_id": run_id,
         "repo_url": request.repo_url,
         "workspace_path": context.workspace_path,
+        "scanner_backend": backend,
         "findings": _scan_to_findings(merged),
         "scan_status": merged.get("status", "success"),
         "critical_vulnerabilities": merged.get("critical_vulnerabilities", 0),

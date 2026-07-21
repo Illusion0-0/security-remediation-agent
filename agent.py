@@ -1,5 +1,5 @@
 from google.adk.agents import SequentialAgent
-from .subagents.java_vulnerability_scanner_agent.agent import java_vulnerability_scanner_agent
+from .subagents.java_vulnerablility_scanner_agent.agent import java_vulnerability_scanner_agent
 from .subagents.java_vulnerability_fixer_agent.agent import java_vulnerability_fixer_agent
 
 root_agent = SequentialAgent(

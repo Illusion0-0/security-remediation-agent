@@ -6,6 +6,8 @@ import tempfile
 import shutil
 from pathlib import Path
 
+from .static_scanner import scan_workspace_static
+
 MAX_REMEDIATION_TARGETS = 100
 MAX_SUMMARY_LENGTH = 320
 TABLE_COLUMN_COUNT = 8
@@ -478,7 +480,38 @@ def _build_remediation_targets(findings: list[dict]) -> list[dict]:
     return remediation_targets[:MAX_REMEDIATION_TARGETS]
 
 
+def _jf_cli_available() -> bool:
+    """Check whether the JFrog CLI (jf) is installed and reachable."""
+    try:
+        result = subprocess.run(["jf", "--version"], capture_output=True, text=True, timeout=15)
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+SCANNER_BACKEND = os.getenv("SCANNER_BACKEND", "auto").strip().lower() or "auto"
+
+
 def run_jf_audit_scan(workspace_url: str) -> dict:
+    """Run a vulnerability scan, dispatching to JFrog or the static CVE fallback.
+
+    Backend selection:
+      - SCANNER_BACKEND=static -> offline CVE database (no jf/network needed)
+      - SCANNER_BACKEND=jf     -> JFrog CLI (requires jf installed + configured)
+      - SCANNER_BACKEND=auto   -> jf if available, else static (default)
+    """
+    backend = SCANNER_BACKEND
+    if backend == "static":
+        return scan_workspace_static(workspace_url)
+    if backend == "jf":
+        return _run_jf_audit_scan_raw(workspace_url)
+    # auto
+    if _jf_cli_available():
+        return _run_jf_audit_scan_raw(workspace_url)
+    return scan_workspace_static(workspace_url)
+
+
+def _run_jf_audit_scan_raw(workspace_url: str) -> dict:
     """
     Run JFrog Audit scan on the Maven project.
 
