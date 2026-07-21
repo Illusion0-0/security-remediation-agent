@@ -1,85 +1,64 @@
-# Java Vulnerabilities Remover
+# Security Remediation Agent
 
-## Overview
-This is a multi-agent workflow to scan and fix Java Maven project vulnerabilities using JFrog Audit.
+AI-Assisted Secure Software Development (Hackathon 2026 — Example 2.4).
 
-## Agents Included
+Multi-language vulnerability remediation agent built on Google ADK with pluggable
+LLM support (Claude / GLM / Gemini / OpenAI).
 
-### 1. Java Vulnerability Scanner Agent
-- **Purpose:** Scans the Maven project for security vulnerabilities
-- **Action:** Executes `jf audit --mvn` in the workspace root
-- **Output:** Comprehensive vulnerability report with counts and affected dependencies
+## Features
 
-### 2. Java Vulnerability Fixer Agent
-- **Purpose:** Fixes identified vulnerabilities by updating Maven dependencies
-- **Actions:**
-  - Updates pom.xml with recommended fixed versions
-  - Runs tests to validate changes
-  - Performs iterative remediation until all High/Critical vulnerabilities are eliminated
-  - Starts the application to verify runtime stability
+- **Multi-language scanning** — Java/Maven, Python/pip, Node.js/npm (auto-detected)
+- **Pluggable scanner backend** — static CVE database (offline) or JFrog CLI
+- **Pluggable LLM** — Claude (default), GLM-4, Gemini, or GPT-4o via LiteLLM
+- **Cross-model judge** — a second LLM independently reviews each remediation
+- **GitHub PR creation** — real pull requests via the GitHub REST API
+- **ADK agents** — scanner + fixer agents with tool integrations
 
-## Workflow
+## Quick Start
 
-The agents work sequentially:
-1. **Scanner Agent** -> Scans for vulnerabilities and creates report
-2. **Fixer Agent** -> Reads report, fixes vulnerabilities, validates changes
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --only-binary :all: -r requirements.txt
 
-## Success Criteria
+# Configure model (auto-detects from available API keys)
+$env:ADK_MODEL = "claude-sonnet"   # or gemini-2.5-flash, glm-4, gpt-4o
+$env:SCANNER_BACKEND = "static"    # offline CVE database
 
-The workflow is considered successful when:
-1. `jf audit --mvn` reports ZERO High and ZERO Critical vulnerabilities
-2. All Maven tests pass
-3. Application starts successfully
-
-## Usage
-
-Run with: `Start the scan` or similar command to trigger the workflow.
-
-## ADK Wrapper API Server
-
-This project now includes an HTTP wrapper service used by `hackathon_prototype_v2`.
-
-### Start the wrapper
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn api_server:app --host 127.0.0.1 --port 8081
+# Start the agent server (port 8081)
+.\start_agent.bat
 ```
 
-### Exposed endpoints
+## Endpoints
 
-- `POST /scan` (accepts `repo_url`, optional `run_id`)
-- `POST /remediate/plan`
-- `POST /remediate/apply`
-- `POST /validate`
-- `POST /report`
-- `DELETE /runs/{run_id}` (cleanup temporary cloned workspace)
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /health` | Service health + active scanner backend |
+| `POST /scan` | Scan a workspace (auto-detects Java/Python/Node.js) |
+| `POST /judge` | Cross-model review of remediation proposals |
+| `POST /remediate/plan` | Generate fix proposals from findings |
+| `POST /remediate/apply` | Apply fixes + create GitHub PR |
+| `POST /validate` | Validate build/tests after remediation |
+| `POST /report` | Generate evidence bundle |
+| `DELETE /runs/{run_id}` | Cleanup workspace |
 
-### URL-based scan flow
+## Environment Variables
 
-1. Accept GitHub repository URL from caller.
-2. Clone repository into temporary local workspace.
-3. Run `jf audit --mvn --fixable-only` from cloned workspace.
-4. Return normalized findings and remediation targets.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ADK_MODEL` | auto | `claude-sonnet`, `glm-4`, `gemini-2.5-flash`, `gpt-4o` |
+| `SCANNER_BACKEND` | auto | `static`, `jf`, or `auto` (jf if available) |
+| `GH_TOKEN` | — | GitHub token for PR creation |
+| `ANTHROPIC_API_KEY` | — | For Claude |
+| `GOOGLE_API_KEY` | — | For Gemini |
+| `ZHIPUAI_API_KEY` | — | For GLM-4 |
 
-## Tools Used
+## Architecture
 
-### Scanner Agent Tools
-- `run_jf_audit_scan` - Runs JFrog audit scan
-- `parse_vulnerability_report` - Parses scan results
-
-### Fixer Agent Tools
-- `update_pom_xml` - Updates dependencies in pom.xml
-- `run_mvn_clean_install` - Builds project with Maven
-- `run_mvn_test` - Runs test suite
-- `start_application` - Starts Spring Boot application
-- `extract_recommended_versions` - Extracts fix recommendations
-
-## Configuration
-
-- **Java Version:** Requires Java/Maven environment
-- **Tools:** JFrog CLI (`jf`) must be installed
-- **Timeout:** Individual operations timeout after specific durations
-- **Memory:** Findings stored in the memoey context between agents
+```
+api_server.py              <- FastAPI wrapper exposing /scan, /judge, /remediate/*
+multi_scanner.py           <- Multi-language static CVE scanner
+cross_model_judge.py       <- Cross-model judge (LiteLLM)
+github_pr.py               <- GitHub PR creation via REST API
+model_config.py            <- Pluggable LLM resolution
+agent.py                   <- ADK SequentialAgent (scanner -> fixer)
+subagents/                 <- Scanner + Fixer ADK agents with tools

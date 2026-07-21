@@ -1,6 +1,37 @@
+﻿# Python
 .venv/
+venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ADK artifacts
 .adk_artifacts/
-*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Env
 .env
+.env.local
+*.log
+
+# Temp scripts (patch/setup helpers)
+_*.py
+apply_patches.py
+fix_imports.py
+patch_agents.py
