@@ -564,8 +564,12 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
     edit_result = apply_remediation(workspace_path, request.proposals)
     changes = edit_result.get("changes", [])
     changed_files = edit_result.get("changed_files", [])
+    # Filter out generated/build files - only include source files we edited
+    _GEN = ["package-lock.json", "node_modules", "/target/", ".class", "__pycache__", ".pyc"]
+    changed_files = [f for f in changed_files if not any(g in f for g in _GEN)]
     if not changed_files:
-        changed_files = _git_changed_files(workspace_path)
+        git_files = _git_changed_files(workspace_path)
+        changed_files = [f for f in git_files if not any(g in f for g in _GEN)]
     if not changed_files:
         changed_files = ["pom.xml"]
 
@@ -590,6 +594,8 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
         test_results["status"] = test_results_after.get("status", "failed")
         # Update changed files if AI modified anything
         new_changed = _git_changed_files(workspace_path)
+        _GEN2 = ["package-lock.json", "node_modules", "/target/", ".class", "__pycache__", ".pyc"]
+        new_changed = [f for f in new_changed if not any(g in f for g in _GEN2)]
         if new_changed:
             changed_files = sorted(set(changed_files + new_changed))
 
