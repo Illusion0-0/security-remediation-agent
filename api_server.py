@@ -555,7 +555,7 @@ async def remediate_plan(request: PlanRequest) -> dict[str, Any]:
 async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
     """Apply version bumps, run tests, AI-fix failures, create PR."""
     from file_editor import apply_remediation
-    from test_runner import run_tests
+    from breaking_change_checker import check_breaking_changes
     from ai_fixer import ai_fix_code
 
     context = _ensure_workspace(request.repo_url, request.run_id)
@@ -589,7 +589,7 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
     if failed_tests:
         ai_fix_result = ai_fix_code(workspace_path, failed_tests, changed_files)
         # Re-run tests after AI fix
-        test_results_after = run_tests(workspace_path)
+        test_results_after = check_breaking_changes(workspace_path, changed_files, request.proposals)
         test_results["ai_fix_applied"] = ai_fix_result
         test_results["after_ai_fix"] = test_results_after
         test_results["status"] = test_results_after.get("status", "failed")
