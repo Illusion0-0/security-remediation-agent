@@ -1,5 +1,5 @@
-from __future__ import annotations
-
+    test_results = check_breaking_changes(workspace_path, changed_files, request.proposals)
+    test_results = check_breaking_changes(workspace_path, changed_files, request.proposals)
 import subprocess
 import os
 import json
@@ -581,7 +581,7 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
         if ':' in d and not d.lower().startswith(('pypi','npm')): detected.add('java')
         elif any(x in d.lower() for x in ['requests','urllib3','cryptography','pillow','pyyaml','jinja2','werkzeug','aiohttp','setuptools','django']): detected.add('python')
         elif any(x in d.lower() for x in ['lodash','axios','express','minimatch','handlebars','qs','moment','jsonwebtoken','node-forge']): detected.add('nodejs')
-    test_results = run_tests(workspace_path, languages=list(detected) if detected else None)
+    test_results = check_breaking_changes(workspace_path, changed_files, request.proposals)
     ai_fix_result = None
 
     # Step 3: If tests failed, use AI to fix code issues (GLM-5.2 via z.ai)
