@@ -303,13 +303,19 @@ def _detect_all_services(workspace_url: str) -> list[tuple[str, Path]]:
 # Scanner entry point
 # ---------------------------------------------------------------------------
 
-def scan_workspace_multi(workspace_url: str) -> dict[str, Any]:
+def scan_workspace_multi(workspace_url: str, languages: list[str] | None = None) -> dict[str, Any]:
     """Scan a workspace for vulnerabilities using OSV.dev API.
 
     Parses dependency files, queries OSV.dev for real CVE data,
     and returns findings in the same format as the previous scanner.
     """
-    services = _detect_all_services(workspace_url)
+    all_services = _detect_all_services(workspace_url)
+    # Filter services by selected languages
+    if languages:
+        lang_map = {"java": "java", "python": "python", "nodejs": "nodejs"}
+        services = [(lang, d) for lang, d in all_services if lang in (languages or [])]
+    else:
+        services = all_services
 
     if not services:
         workspace = Path(workspace_url)

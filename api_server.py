@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 class ScanRequest(BaseModel):
     repo_url: str
     run_id: str | None = None
+    languages: list[str] | None = None
 
 
 class PlanRequest(BaseModel):
@@ -454,7 +455,7 @@ async def scan(request: ScanRequest) -> dict[str, Any]:
 
     if backend == "static":
         # Offline deterministic scanner - no JFrog CLI or network required.
-        merged = scan_workspace_multi(context.workspace_path)
+        merged = scan_workspace_multi(context.workspace_path, languages=request.languages)
         if merged.get("scan_execution_error") or merged.get("status") == "error":
             raise HTTPException(status_code=400, detail=merged.get("error") or "Static scan failed")
     else:
