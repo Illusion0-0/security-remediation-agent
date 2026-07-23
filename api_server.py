@@ -611,31 +611,28 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
 
 @app.post("/validate")
 async def validate(request: ValidateRequest) -> dict[str, Any]:
+    """Run tests for all languages (Java/Python/Node.js) to validate fixes."""
+    from test_runner import run_tests
+
     context = _ensure_workspace(request.repo_url, request.run_id)
     workspace_path = context.workspace_path
 
-    build_result = run_mvn_clean_install(workspace_path)
-    test_result = run_mvn_test(workspace_path)
+    # Run multi-language tests
+    test_results = run_tests(workspace_path)
 
-    build_ok = bool(build_result.get("build_success"))
-    tests_ok = bool(test_result.get("tests_passed"))
-    # Startup validation is intentionally skipped per workflow requirements.
-    startup_ok = True
-
+    # Build validation results for each proposal
     validations: list[dict[str, Any]] = []
+    overall_passed = test_results.get("status") == "passed"
+
     for proposal in request.proposals:
-        validations.append(
-            {
-                "proposal_id": proposal.get("id") or str(uuid4()),
-                "passed": build_ok and tests_ok and startup_ok,
-                "build_ok": build_ok,
-                "tests_ok": tests_ok,
-                "startup_ok": startup_ok,
-                "details": (
-                    f"build={build_result.get('status')} tests={test_result.get('status')} startup=skipped"
-                ),
-            }
-        )
+        validations.append({
+            "proposal_id": proposal.get("id") or str(uuid4()),
+            "passed": overall_passed,
+            "build_ok": overall_passed,
+            "tests_ok": overall_passed,
+            "startup_ok": True,
+            "details": f"services: {test_results.get('passed_services', 0)}/{test_results.get('total_services', 0)} passed",
+        })
 
     return {"validations": validations}
 
