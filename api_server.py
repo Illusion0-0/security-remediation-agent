@@ -570,7 +570,13 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
         changed_files = ["pom.xml"]
 
     # Step 2: Run tests to validate the fixes
-    test_results = run_tests(workspace_path, languages=request.proposals[0].get('languages') if request.proposals else None)
+    detected=set()
+    for p in request.proposals:
+        d=p.get('dependency','')
+        if ':' in d and not d.lower().startswith(('pypi','npm')): detected.add('java')
+        elif any(x in d.lower() for x in ['requests','urllib3','cryptography','pillow','pyyaml','jinja2','werkzeug','aiohttp','setuptools','django']): detected.add('python')
+        elif any(x in d.lower() for x in ['lodash','axios','express','minimatch','handlebars','qs','moment','jsonwebtoken','node-forge']): detected.add('nodejs')
+    test_results = run_tests(workspace_path, languages=list(detected) if detected else None)
     ai_fix_result = None
 
     # Step 3: If tests failed, use AI to fix code issues (GLM-5.2 via z.ai)
@@ -618,7 +624,22 @@ async def validate(request: ValidateRequest) -> dict[str, Any]:
     workspace_path = context.workspace_path
 
     # Run multi-language tests
-    test_results = run_tests(workspace_path, languages=request.proposals[0].get('languages') if request.proposals else None)
+    # Infer languages from proposals (Java deps have "groupId:artifactId" format)
+    detected_langs = set()
+    JAVA_PKGS = {"log4j-core", "commons-text", "jackson-databind", "snakeyaml", "commons-io", "dom4j", "guava", "xstream", "commons-compress"}
+    PY_PKGS = {"requests", "urllib3", "cryptography", "pillow", "pyyaml", "jinja2", "werkzeug", "aiohttp", "setuptools", "django"}
+    NODE_PKGS = {"lodash", "axios", "express", "minimatch", "handlebars", "qs", "moment", "ws", "jsonwebtoken", "node-forge"}
+    for prop in request.proposals:
+        dep = prop.get("dependency", "").lower()
+        pkg = dep.split(":")[-1] if ":" in dep else dep
+        if ":" in prop.get("dependency", "") and not dep.startswith(("pypi", "npm")):
+            detected_langs.add("java")
+        elif pkg in PY_PKGS or "pypi" in dep:
+            detected_langs.add("python")
+        elif pkg in NODE_PKGS or "npm" in dep:
+            detected_langs.add("nodejs")
+    languages = list(detected_langs) if detected_langs else None
+    test_results = run_tests(workspace_path, languages=languages)
 
     # Build validation results for each proposal
     validations: list[dict[str, Any]] = []
