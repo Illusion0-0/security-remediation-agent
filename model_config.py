@@ -1,21 +1,19 @@
 """Pluggable LLM model configuration for Google ADK agents.
 
-Supports multiple providers:
-  - z.ai (GLM models — OpenAI-compatible API at api.z.ai)
+Supports:
+  - z.ai GLM (glm-5.2, glm-4 variants — OpenAI-compatible at api.z.ai)
   - Google Gemini (native ADK)
   - Anthropic Claude (via LiteLLM)
   - OpenAI (via LiteLLM)
-
-Set via ADK_MODEL env var. Keys via provider-specific env vars.
 """
 from __future__ import annotations
 
 import os
 
-
 # Model aliases → provider-qualified strings
 MODEL_ALIASES: dict[str, str] = {
     # z.ai GLM (OpenAI-compatible, international endpoint)
+    "glm-5.2": "openai/glm-5.2",
     "glm-4": "openai/glm-4",
     "glm-4-flash": "openai/glm-4-flash",
     "glm-4-plus": "openai/glm-4-plus",
@@ -34,7 +32,6 @@ MODEL_ALIASES: dict[str, str] = {
     "gpt-4o-mini": "litellm/openai/gpt-4o-mini",
 }
 
-# Provider → API key env var
 PROVIDER_API_KEY_ENV: dict[str, str] = {
     "zai": "ZAI_API_KEY",
     "gemini": "GOOGLE_API_KEY",
@@ -42,14 +39,12 @@ PROVIDER_API_KEY_ENV: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
 }
 
-# z.ai API base URL
 ZAI_API_BASE = "https://api.z.ai/api/paas/v4"
 
 
 def _default_model() -> str:
-    """Return the default model based on which API keys are available."""
     if os.getenv("ZAI_API_KEY"):
-        return "glm-4"
+        return "glm-5.2"
     if os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY"):
         return "gemini-2.0-flash"
     if os.getenv("ANTHROPIC_API_KEY"):
@@ -58,27 +53,20 @@ def _default_model() -> str:
 
 
 def resolve_model(model_hint: str | None = None) -> str:
-    """Resolve the LLM model string to pass to ADK / LiteLLM."""
     requested = (model_hint or os.getenv("ADK_MODEL") or "").strip()
     if not requested:
         requested = _default_model()
-
     resolved = MODEL_ALIASES.get(requested, requested)
-
-    # IMPORTANT: For z.ai, we need to set OPENAI_API_BASE and OPENAI_API_KEY
-    # so LiteLLM routes to z.ai's endpoint instead of OpenAI's default.
     provider = active_provider_from_string(resolved)
     if provider == "zai":
         zai_key = os.getenv("ZAI_API_KEY", "")
         os.environ["OPENAI_API_BASE"] = ZAI_API_BASE
         if zai_key:
             os.environ["OPENAI_API_KEY"] = zai_key
-
     return resolved
 
 
 def active_provider_from_string(model: str) -> str:
-    """Return the active provider name from a model string."""
     if model.startswith("openai/glm"):
         return "zai"
     if model.startswith("gemini"):
@@ -91,13 +79,10 @@ def active_provider_from_string(model: str) -> str:
 
 
 def active_provider() -> str:
-    """Return the active provider name (zai, gemini, anthropic, openai)."""
-    model = resolve_model()
-    return active_provider_from_string(model)
+    return active_provider_from_string(resolve_model())
 
 
 def validate_api_key() -> tuple[bool, str]:
-    """Check whether the required API key for the active provider is set."""
     provider = active_provider()
     env_var = PROVIDER_API_KEY_ENV.get(provider, "")
     if not env_var:
@@ -109,8 +94,6 @@ def validate_api_key() -> tuple[bool, str]:
 
 
 def get_litellm_params() -> dict[str, str]:
-    """Get extra LiteLLM params (api_base) for providers with custom endpoints."""
-    provider = active_provider()
-    if provider == "zai":
+    if active_provider() == "zai":
         return {"api_base": ZAI_API_BASE}
     return {}
