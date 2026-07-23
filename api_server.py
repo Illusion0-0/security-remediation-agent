@@ -552,27 +552,42 @@ async def remediate_plan(request: PlanRequest) -> dict[str, Any]:
 
 @app.post("/remediate/apply")
 async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
-    """Apply version bumps directly (no LLM), run tests, create PR."""
+    """Apply version bumps, run tests, AI-fix failures, create PR."""
     from file_editor import apply_remediation
     from test_runner import run_tests
+    from ai_fixer import ai_fix_code
 
     context = _ensure_workspace(request.repo_url, request.run_id)
     workspace_path = context.workspace_path
 
-    # Step 1: Apply version bumps directly (no AI needed)
+    # Step 1: Apply version bumps directly (no AI needed for pom.xml/requirements.txt/package.json)
     edit_result = apply_remediation(workspace_path, request.proposals)
     changes = edit_result.get("changes", [])
     changed_files = edit_result.get("changed_files", [])
-
     if not changed_files:
         changed_files = _git_changed_files(workspace_path)
     if not changed_files:
         changed_files = ["pom.xml"]
 
-    # Step 2: Run tests to validate fixes
+    # Step 2: Run tests to validate the fixes
     test_results = run_tests(workspace_path)
+    ai_fix_result = None
 
-    # Step 3: Create GitHub PR (direct API, no AI)
+    # Step 3: If tests failed, use AI to fix code issues (GLM-5.2 via z.ai)
+    failed_tests = [r for r in test_results.get("results", []) if not r.get("passed")]
+    if failed_tests:
+        ai_fix_result = ai_fix_code(workspace_path, failed_tests, changed_files)
+        # Re-run tests after AI fix
+        test_results_after = run_tests(workspace_path)
+        test_results["ai_fix_applied"] = ai_fix_result
+        test_results["after_ai_fix"] = test_results_after
+        test_results["status"] = test_results_after.get("status", "failed")
+        # Update changed files if AI modified anything
+        new_changed = _git_changed_files(workspace_path)
+        if new_changed:
+            changed_files = sorted(set(changed_files + new_changed))
+
+    # Step 4: Create GitHub PR (direct API, no AI)
     pr_result = _maybe_create_github_pr(
         repo_url=request.repo_url, workspace_path=workspace_path,
         changed_files=changed_files, changes=changes,
@@ -588,6 +603,7 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
             "status": edit_result.get("status"),
             "updated_count": edit_result.get("updated_count", 0),
             "test_results": test_results,
+            "ai_fix": ai_fix_result,
         },
         "pull_request": pr_result,
     }
