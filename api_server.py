@@ -599,6 +599,12 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
             changed_files = sorted(set(changed_files + new_changed))
 
     # Step 4: Create GitHub PR (direct API, no AI)
+    _GEN3 = ['package-lock.json', 'node_modules', '/target/', '.class', '__pycache__', '.pyc']
+    all_git = _git_changed_files(workspace_path)
+    all_git = [f for f in all_git if not any(g in f for g in _GEN3)]
+    if all_git:
+        changed_files = sorted(set(changed_files + all_git))
+
     pr_result = _maybe_create_github_pr(
         repo_url=request.repo_url, workspace_path=workspace_path,
         changed_files=changed_files, changes=changes,
