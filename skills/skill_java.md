@@ -3,9 +3,10 @@
 ## Known Breaking Changes (Critical Knowledge)
 
 ### Commons IO 2.6 → 2.7+
-- `IOUtils.copy(InputStream, OutputStream)` return type changed from `int` to `long`
-- Fix: Change `int bytesCopied = IOUtils.copy(...)` to `long bytesCopied = IOUtils.copy(...)`
-- If method returns int wrapper: change return type or cast: `return (int) IOUtils.copy(...)`
+- `IOUtils.copy(InputStream, OutputStream, int)` (3-arg version with buffer size) return type changed from `int` to `long`
+- Fix: Change `int bytesCopied = IOUtils.copy(input, output, 4096)` to `long bytesCopied = IOUtils.copy(input, output, 4096)`
+- If method returns int wrapper: change return type or cast: `return (int) bytesCopied`
+- Note: The 2-argument version `IOUtils.copy(InputStream, OutputStream)` still returns int in 2.7
 
 ### Log4j 2.14 → 2.17+
 - `LogManager.getLogger()` API unchanged, but some internal classes moved
