@@ -31,7 +31,7 @@ def detect_all_services(workspace_url: str) -> list[tuple[str, Path]]:
     return services
 
 
-def run_tests(workspace_url: str) -> dict[str, Any]:
+def run_tests(workspace_url: str, languages: list[str] | None = None) -> dict[str, Any]:
     """Run tests for all services in the workspace.
 
     Returns:
@@ -53,6 +53,10 @@ def run_tests(workspace_url: str) -> dict[str, Any]:
         }
     """
     services = detect_all_services(workspace_url)
+    # Filter by selected languages if provided
+    if languages:
+        lang_map = {"java": "java", "python": "python", "nodejs": "nodejs"}
+        services = [(lang, d) for lang, d in services if lang in (languages or [])]
     results: list[dict[str, Any]] = []
     any_failed = False
 

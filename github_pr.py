@@ -120,6 +120,11 @@ def create_pull_request(
         base = base_branch or _get_default_branch(token, owner, repo)
 
         # Create branch from base branch's HEAD SHA
+        # Delete existing branch if it exists (retries create duplicate branches)
+        try:
+            _gh_api("DELETE", f"/repos/{owner}/{repo}/git/refs/heads/{branch_name}", token)
+        except Exception:
+            pass  # Branch doesn't exist yet — that's fine
         ref_info = _gh_api("GET", f"/repos/{owner}/{repo}/git/ref/heads/{base}", token)
         base_sha = ref_info["object"]["sha"]
         _gh_api("POST", f"/repos/{owner}/{repo}/git/refs", token, {

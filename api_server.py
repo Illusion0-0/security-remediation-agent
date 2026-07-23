@@ -570,7 +570,7 @@ async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
         changed_files = ["pom.xml"]
 
     # Step 2: Run tests to validate the fixes
-    test_results = run_tests(workspace_path)
+    test_results = run_tests(workspace_path, languages=request.proposals[0].get('languages') if request.proposals else None)
     ai_fix_result = None
 
     # Step 3: If tests failed, use AI to fix code issues (GLM-5.2 via z.ai)
@@ -618,7 +618,7 @@ async def validate(request: ValidateRequest) -> dict[str, Any]:
     workspace_path = context.workspace_path
 
     # Run multi-language tests
-    test_results = run_tests(workspace_path)
+    test_results = run_tests(workspace_path, languages=request.proposals[0].get('languages') if request.proposals else None)
 
     # Build validation results for each proposal
     validations: list[dict[str, Any]] = []
