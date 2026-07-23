@@ -1,17 +1,35 @@
-"""Multi-language vulnerability scanner with static CVE fallback.
+"""Multi-language vulnerability scanner using OSV.dev API.
 
-Supports monorepos — scans all subdirectories for different languages.
+Replaces the hardcoded CVE database with real-time vulnerability data from
+Google's OSV.dev (https://osv.dev) — a free, open-source vulnerability database.
+
+Supports:
+  - Java/Maven (pom.xml)
+  - Python/PyPI (requirements.txt)
+  - Node.js/npm (package.json)
+  - Monorepos (scans subdirectories)
+
+The OSV.dev API is free, requires no API key, and covers all major ecosystems.
 """
 from __future__ import annotations
 
 import json
 import re
+import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-SEVERITY_PRIORITY = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+SEVERITY_PRIORITY = {"CRITICAL": 0, "HIGH": 1, "MODERATE": 2, "MEDIUM": 2, "LOW": 3}
+SEVERITY_DISPLAY = {"CRITICAL": "Critical", "HIGH": "High", "MODERATE": "Medium", "MEDIUM": "Medium", "LOW": "Low"}
 
+SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "target", ".adk_artifacts", ".idea", ".vscode", ".mvn"}
+
+
+# ---------------------------------------------------------------------------
+# Version comparison
+# ---------------------------------------------------------------------------
 
 def _version_key(version: str) -> list[tuple[int, int | str]]:
     tokens = re.findall(r"\d+|[A-Za-z]+", str(version))
@@ -21,68 +39,246 @@ def _version_key(version: str) -> list[tuple[int, int | str]]:
     return parsed
 
 
-def _compare_versions(left: str | None, right: str | None) -> int:
+def _compare_versions(left: str, right: str) -> int:
     if left == right:
         return 0
-    if not left:
-        return -1
-    if not right:
-        return 1
-    left_key, right_key = _version_key(left), _version_key(right)
-    for i in range(max(len(left_key), len(right_key))):
-        lt = left_key[i] if i < len(left_key) else (1, 0)
-        rt = right_key[i] if i < len(right_key) else (1, 0)
+    lk, rk = _version_key(left), _version_key(right)
+    for i in range(max(len(lk), len(rk))):
+        lt = lk[i] if i < len(lk) else (1, 0)
+        rt = rk[i] if i < len(rk) else (1, 0)
         if lt != rt:
             return 1 if lt > rt else -1
     return 0
 
 
-def _is_vulnerable(version: str, entry: dict[str, Any]) -> bool:
-    if "vulnerable_below" in entry and _compare_versions(version, entry["vulnerable_below"]) < 0:
+def _is_affected(version: str, affected_entry: dict) -> bool:
+    """Check if a version is affected by an OSV vulnerability entry."""
+    ranges = affected_entry.get("ranges", [])
+    for r in ranges:
+        if r.get("type") == "ECOSYSTEM":
+            for event in r.get("events", []):
+                introduced = event.get("introduced")
+                fixed = event.get("fixed")
+                if introduced and _compare_versions(version, introduced) >= 0:
+                    if not fixed or _compare_versions(version, fixed) < 0:
+                        return True
+        elif r.get("type") == "SEMVER":
+            for event in r.get("events", []):
+                introduced = event.get("introduced")
+                fixed = event.get("fixed")
+                if introduced and _compare_versions(version, introduced) >= 0:
+                    if not fixed or _compare_versions(version, fixed) < 0:
+                        return True
+    # Also check explicit version lists
+    versions = affected_entry.get("versions", [])
+    if version in versions:
         return True
-    for lower, upper in entry.get("vulnerable_ranges", []):
-        if _compare_versions(version, lower) >= 0 and _compare_versions(version, upper) < 0:
-            return True
     return False
 
 
-# CVE Databases
-PYTHON_CVE_DATABASE: dict[str, dict[str, Any]] = {
-    "requests": {"cves": ["CVE-2023-32681"], "severity": "High", "vulnerable_below": "2.31.0", "fixed_version": "2.31.0", "fixed_candidates": ["2.31.0", "2.32.0"], "description": "Proxy-Authorization header leak"},
-    "urllib3": {"cves": ["CVE-2023-43804", "CVE-2023-45803"], "severity": "High", "vulnerable_below": "1.26.18", "fixed_version": "1.26.18", "fixed_candidates": ["1.26.18", "2.0.7"], "description": "Cookie leak on redirect"},
-    "cryptography": {"cves": ["CVE-2023-49083"], "severity": "High", "vulnerable_below": "41.0.6", "fixed_version": "41.0.6", "fixed_candidates": ["41.0.6", "42.0.0"], "description": "NULL signature forgery"},
-    "pillow": {"cves": ["CVE-2023-50447"], "severity": "High", "vulnerable_below": "10.2.0", "fixed_version": "10.2.0", "fixed_candidates": ["10.2.0", "10.3.0"], "description": "RCE via crafted image"},
-    "pyyaml": {"cves": ["CVE-2020-1747", "CVE-2020-14343"], "severity": "Critical", "vulnerable_below": "5.4", "fixed_version": "5.4", "fixed_candidates": ["5.4", "6.0"], "description": "RCE via unsafe YAML"},
-    "jinja2": {"cves": ["CVE-2024-22195"], "severity": "Medium", "vulnerable_below": "3.1.3", "fixed_version": "3.1.3", "fixed_candidates": ["3.1.3", "3.1.4"], "description": "XSS via xmlattr"},
-    "werkzeug": {"cves": ["CVE-2023-46136"], "severity": "Medium", "vulnerable_below": "3.0.1", "fixed_version": "3.0.1", "fixed_candidates": ["3.0.1", "3.0.3"], "description": "Multipart DoS"},
-    "aiohttp": {"cves": ["CVE-2024-23334"], "severity": "High", "vulnerable_below": "3.9.2", "fixed_version": "3.9.2", "fixed_candidates": ["3.9.2", "3.9.3"], "description": "Directory traversal"},
-    "setuptools": {"cves": ["CVE-2024-6345"], "severity": "High", "vulnerable_below": "70.0.0", "fixed_version": "70.0.0", "fixed_candidates": ["70.0.0"], "description": "RCE via package index"},
-    "django": {"cves": ["CVE-2023-46695"], "severity": "High", "vulnerable_below": "4.2.7", "fixed_version": "4.2.7", "fixed_candidates": ["4.2.7", "4.2.16"], "description": "DoS via username"},
-}
+# ---------------------------------------------------------------------------
+# Dependency file parsers
+# ---------------------------------------------------------------------------
 
-NODE_CVE_DATABASE: dict[str, dict[str, Any]] = {
-    "lodash": {"cves": ["CVE-2021-23337"], "severity": "Critical", "vulnerable_below": "4.17.21", "fixed_version": "4.17.21", "fixed_candidates": ["4.17.21"], "description": "Prototype pollution"},
-    "axios": {"cves": ["CVE-2023-45857"], "severity": "High", "vulnerable_below": "1.6.0", "fixed_version": "1.6.0", "fixed_candidates": ["1.6.0", "1.7.0"], "description": "CSRF token leak"},
-    "express": {"cves": ["CVE-2024-29041"], "severity": "Medium", "vulnerable_below": "4.19.2", "fixed_version": "4.19.2", "fixed_candidates": ["4.19.2"], "description": "Open redirect"},
-    "minimatch": {"cves": ["CVE-2022-3517"], "severity": "High", "vulnerable_below": "3.0.5", "fixed_version": "3.0.5", "fixed_candidates": ["3.0.5"], "description": "ReDoS"},
-    "handlebars": {"cves": ["CVE-2023-26136"], "severity": "Critical", "vulnerable_below": "4.7.7", "fixed_version": "4.7.7", "fixed_candidates": ["4.7.7"], "description": "Prototype pollution RCE"},
-    "qs": {"cves": ["CVE-2022-24999"], "severity": "High", "vulnerable_below": "6.5.3", "fixed_version": "6.5.3", "fixed_candidates": ["6.5.3"], "description": "Prototype pollution"},
-    "moment": {"cves": ["CVE-2022-31129"], "severity": "High", "vulnerable_below": "2.29.4", "fixed_version": "2.29.4", "fixed_candidates": ["2.29.4"], "description": "ReDoS"},
-    "ws": {"cves": ["CVE-2024-37890"], "severity": "High", "vulnerable_below": "8.17.1", "fixed_version": "8.17.1", "fixed_candidates": ["8.17.1"], "description": "DoS via upgrade"},
-    "jsonwebtoken": {"cves": ["CVE-2022-23529"], "severity": "Critical", "vulnerable_below": "9.0.0", "fixed_version": "9.0.0", "fixed_candidates": ["9.0.0"], "description": "Algorithm confusion"},
-    "node-forge": {"cves": ["CVE-2022-24771"], "severity": "Critical", "vulnerable_below": "1.3.1", "fixed_version": "1.3.1", "fixed_candidates": ["1.3.1"], "description": "Prototype pollution"},
-}
+def _parse_pom_xml(pom_path: Path) -> list[dict[str, str]]:
+    """Parse pom.xml → list of {name, version, ecosystem: 'Maven'}."""
+    deps: list[dict[str, str]] = []
+    try:
+        tree = ET.parse(pom_path)
+        root = tree.getroot()
+    except ET.ParseError:
+        return deps
 
-SKIP_DIRS = {".", "..", ".git", ".venv", "venv", "node_modules", "__pycache__", "target", ".adk_artifacts", ".idea", ".vscode"}
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
 
+    # Extract parent version for property resolution
+    parent_version = ""
+    parent = root.find(f"{ns}parent")
+    if parent is not None:
+        pv = parent.find(f"{ns}version")
+        if pv is not None and pv.text:
+            parent_version = pv.text.strip()
+
+    # Collect properties
+    props: dict[str, str] = {}
+    props_el = root.find(f"{ns}properties")
+    if props_el is not None:
+        for child in props_el:
+            tag = child.tag.replace(ns, "")
+            if child.text:
+                props[tag] = child.text.strip()
+
+    for dep in root.iter(f"{ns}dependency"):
+        gid_el = dep.find(f"{ns}groupId")
+        aid_el = dep.find(f"{ns}artifactId")
+        ver_el = dep.find(f"{ns}version")
+        if gid_el is None or aid_el is None:
+            continue
+        gid = (gid_el.text or "").strip()
+        aid = (aid_el.text or "").strip()
+        ver = (ver_el.text or "").strip() if ver_el is not None else ""
+
+        # Resolve ${propertyName} references
+        if ver.startswith("${") and ver.endswith("}"):
+            prop_key = ver[2:-1]
+            ver = props.get(prop_key, parent_version)
+
+        if gid and aid and ver:
+            deps.append({"package": f"{gid}:{aid}", "version": ver, "ecosystem": "Maven"})
+
+    return deps
+
+
+def _parse_requirements(path: Path) -> list[dict[str, str]]:
+    """Parse requirements.txt → list of {name, version, ecosystem: 'PyPI'}."""
+    deps: list[dict[str, str]] = []
+    if not path.exists():
+        return deps
+    pattern = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*[=~<>!]+\s*([0-9A-Za-z.\-+]+)")
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        m = pattern.match(line)
+        if m:
+            deps.append({"package": m.group(1), "version": m.group(2), "ecosystem": "PyPI"})
+    return deps
+
+
+def _parse_package_json(path: Path) -> list[dict[str, str]]:
+    """Parse package.json → list of {name, version, ecosystem: 'npm'}."""
+    deps: list[dict[str, str]] = []
+    if not path.exists():
+        return deps
+    try:
+        pkg = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return deps
+    for section in ("dependencies", "devDependencies"):
+        for name, version in (pkg.get(section) or {}).items():
+            clean_ver = re.sub(r"^[^0-9]*", "", version.strip())
+            if clean_ver:
+                deps.append({"package": name, "version": clean_ver, "ecosystem": "npm"})
+    return deps
+
+
+# ---------------------------------------------------------------------------
+# OSV.dev API
+# ---------------------------------------------------------------------------
+
+OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+OSV_QUERY_URL = "https://api.osv.dev/v1/query"
+
+
+def _query_osv_batch(packages: list[dict[str, str]]) -> dict[str, list[dict]]:
+    """Batch-query OSV.dev for vulnerabilities.
+
+    Returns a dict mapping "package@version" → list of vulnerability entries.
+    """
+    if not packages:
+        return {}
+
+    # Build batch queries
+    queries: list[dict] = []
+    for pkg in packages:
+        queries.append({
+            "version": pkg["version"],
+            "package": {"name": pkg["package"], "ecosystem": pkg["ecosystem"]},
+        })
+
+    # OSV batch API has a limit — chunk into groups of 100
+    results: dict[str, list[dict]] = {}
+    for i in range(0, len(queries), 100):
+        chunk = queries[i:i + 100]
+        batch_request = {"queries": chunk}
+
+        try:
+            data = json.dumps(batch_request).encode("utf-8")
+            req = urllib.request.Request(OSV_BATCH_URL, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                batch_resp = json.loads(resp.read().decode("utf-8"))
+
+            for j, result in enumerate(batch_resp.get("results", [])):
+                pkg = packages[i + j]
+                key = f"{pkg['package']}@{pkg['version']}"
+                vuln_ids = result.get("vulns", [])
+                if vuln_ids:
+                    results[key] = vuln_ids
+        except Exception:
+            # Fallback: query individually
+            for pkg in packages[i:i + 100]:
+                key = f"{pkg['package']}@{pkg['version']}"
+                try:
+                    query = {"version": pkg["version"], "package": {"name": pkg["package"], "ecosystem": pkg["ecosystem"]}}
+                    data = json.dumps(query).encode("utf-8")
+                    req = urllib.request.Request(OSV_QUERY_URL, data=data, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        query_resp = json.loads(resp.read().decode("utf-8"))
+                    if query_resp.get("vulns"):
+                        results[key] = query_resp["vulns"]
+                except Exception:
+                    pass
+
+    return results
+
+
+def _fetch_vuln_detail(vuln_id: str) -> dict | None:
+    """Fetch full vulnerability details from OSV.dev."""
+    url = f"https://api.osv.dev/v1/vulns/{vuln_id}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _extract_severity(vuln: dict) -> str:
+    """Extract the highest severity from an OSV vulnerability entry."""
+    severity_list = vuln.get("severity", [])
+    best = "LOW"
+    for sev in severity_list:
+        score_str = sev.get("score", "")
+        # CVSS vector string: extract severity from text
+        for level in ["CRITICAL", "HIGH", "MODERATE", "MEDIUM", "LOW"]:
+            if level in score_str.upper():
+                if SEVERITY_PRIORITY.get(level, 99) < SEVERITY_PRIORITY.get(best, 99):
+                    best = level
+                break
+    # Also check database_specific for severity
+    db_specific = vuln.get("database_specific", {})
+    if "severity" in db_specific:
+        sev = db_specific["severity"].upper()
+        if SEVERITY_PRIORITY.get(sev, 99) < SEVERITY_PRIORITY.get(best, 99):
+            best = sev
+    return SEVERITY_DISPLAY.get(best, "Medium")
+
+
+def _extract_fixed_version(vuln: dict, package_name: str, ecosystem: str) -> str | None:
+    """Extract the fixed version from an OSV vulnerability entry."""
+    for affected in vuln.get("affected", []):
+        pkg_info = affected.get("package", {})
+        if pkg_info.get("name", "").lower() == package_name.lower() and pkg_info.get("ecosystem") == ecosystem:
+            for r in affected.get("ranges", []):
+                for event in r.get("events", []):
+                    if "fixed" in event:
+                        return event["fixed"]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Language detection (monorepo support)
+# ---------------------------------------------------------------------------
 
 def detect_language(workspace_url: str) -> str:
-    """Detect language from root OR one level deep (monorepo support)."""
+    """Detect language from root or subdirectories."""
     workspace = Path(workspace_url)
     for d in [workspace] + [s for s in workspace.iterdir() if s.is_dir() and s.name not in SKIP_DIRS]:
-        if (d / "pom.xml").exists() or (d / "build.gradle").exists():
+        if (d / "pom.xml").exists():
             return "java"
-        if (d / "requirements.txt").exists() or (d / "pyproject.toml").exists():
+        if (d / "requirements.txt").exists():
             return "python"
         if (d / "package.json").exists():
             return "nodejs"
@@ -94,107 +290,145 @@ def _detect_all_services(workspace_url: str) -> list[tuple[str, Path]]:
     workspace = Path(workspace_url)
     services: list[tuple[str, Path]] = []
     for d in [workspace] + [s for s in workspace.iterdir() if s.is_dir() and s.name not in SKIP_DIRS]:
-        if (d / "pom.xml").exists() or (d / "build.gradle").exists():
+        if (d / "pom.xml").exists():
             services.append(("java", d))
-        if (d / "requirements.txt").exists() or (d / "pyproject.toml").exists():
+        if (d / "requirements.txt").exists():
             services.append(("python", d))
         if (d / "package.json").exists():
             services.append(("nodejs", d))
     return services
 
 
-def _parse_requirements(path: Path) -> list[tuple[str, str]]:
-    deps: list[tuple[str, str]] = []
-    if not path.exists():
-        return deps
-    pattern = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*[=~<>!]+\s*([0-9A-Za-z.\-]+)")
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.split("#")[0].strip()
-        if line:
-            m = pattern.match(line)
-            if m:
-                deps.append((m.group(1).lower(), m.group(2)))
-    return deps
+# ---------------------------------------------------------------------------
+# Scanner entry point
+# ---------------------------------------------------------------------------
 
+def scan_workspace_multi(workspace_url: str) -> dict[str, Any]:
+    """Scan a workspace for vulnerabilities using OSV.dev API.
 
-def _scan_python(workspace_url: str) -> list[dict[str, Any]]:
-    workspace = Path(workspace_url)
-    deps = _parse_requirements(workspace / "requirements.txt")
+    Parses dependency files, queries OSV.dev for real CVE data,
+    and returns findings in the same format as the previous scanner.
+    """
+    services = _detect_all_services(workspace_url)
+
+    if not services:
+        workspace = Path(workspace_url)
+        artifact_dir = workspace / ".adk_artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        report_path = artifact_dir / "scan_latest.txt"
+        report_path.write_text(f"No pom.xml, requirements.txt, or package.json found in {workspace_url}\n", encoding="utf-8")
+        return {
+            "status": "error", "return_code": 1, "report_path": str(report_path), "report_size_chars": 0,
+            "error": "No supported project files found", "vulnerabilities_found": False, "scan_execution_error": True,
+            "scanner_backend": "osv", "language": "unknown",
+            "critical_vulnerabilities": 0, "high_vulnerabilities": 0, "medium_vulnerabilities": 0, "low_vulnerabilities": 0,
+            "total_vulnerabilities": 0, "remediation_targets": [], "affected_dependencies": [],
+        }
+
+    # Collect all dependencies across services
+    all_deps: list[dict[str, str]] = []
+    report_lines = ["=" * 80, "OSV.DEV VULNERABILITY SCAN (Live API)", "=" * 80, f"Workspace: {workspace_url}", f"Services: {len(services)}", ""]
+
+    for lang, svc_dir in services:
+        deps: list[dict[str, str]] = []
+        if lang == "java":
+            deps = _parse_pom_xml(svc_dir / "pom.xml")
+        elif lang == "python":
+            deps = _parse_requirements(svc_dir / "requirements.txt")
+        elif lang == "nodejs":
+            deps = _parse_package_json(svc_dir / "package.json")
+
+        for d in deps:
+            d["service_dir"] = svc_dir.name
+            d["language"] = lang
+        all_deps.extend(deps)
+        report_lines.append(f"  {lang} ({svc_dir.name}): {len(deps)} dependencies")
+
+    report_lines.append(f"\n  Total dependencies: {len(all_deps)}")
+    report_lines.append("\n  Querying OSV.dev for vulnerabilities...")
+
+    # Query OSV.dev
+    vuln_results = _query_osv_batch(all_deps)
+
+    # Build findings
     findings: list[dict[str, Any]] = []
-    for name, version in deps:
-        entry = PYTHON_CVE_DATABASE.get(name)
-        if entry and _is_vulnerable(version, entry):
-            findings.append({"severity": entry["severity"], "groupId": "pypi", "artifactId": name, "current_version": version, "fixed_version": entry["fixed_version"], "fixed_candidates": entry.get("fixed_candidates", [entry["fixed_version"]]), "cves": entry["cves"], "summary": f"{name} {version} -> {entry['fixed_version']}"})
-    return findings
+    processed_vulns: set[str] = set()
 
+    for pkg in all_deps:
+        key = f"{pkg['package']}@{pkg['version']}"
+        vulns = vuln_results.get(key, [])
 
-def _scan_nodejs(workspace_url: str) -> list[dict[str, Any]]:
-    workspace = Path(workspace_url)
-    pkg_path = workspace / "package.json"
-    deps: dict[str, str] = {}
-    if pkg_path.exists():
-        try:
-            pkg = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
-            for section in ("dependencies", "devDependencies"):
-                deps.update({k.lower().lstrip("@"): v.lstrip("^~>=< ") for k, v in (pkg.get(section) or {}).items()})
-        except json.JSONDecodeError:
-            pass
-    findings: list[dict[str, Any]] = []
-    for name, version in deps.items():
-        entry = NODE_CVE_DATABASE.get(name)
-        if entry and _is_vulnerable(version, entry):
-            findings.append({"severity": entry["severity"], "groupId": "npm", "artifactId": name, "current_version": version, "fixed_version": entry["fixed_version"], "fixed_candidates": entry.get("fixed_candidates", [entry["fixed_version"]]), "cves": entry["cves"], "summary": f"{name} {version} -> {entry['fixed_version']}"})
-    return findings
-
-
-def _scan_java(workspace_url: str) -> list[dict[str, Any]]:
-    """Java scanner — parses pom.xml for vulnerable dependencies."""
-    workspace = Path(workspace_url)
-    pom_path = workspace / "pom.xml"
-    if not pom_path.exists():
-        return []
-
-    # Java CVE database (keyed by artifactId)
-    JAVA_CVE_DB: dict[str, dict[str, Any]] = {
-        "log4j-core": {"cves": ["CVE-2021-44228"], "severity": "Critical", "vulnerable_below": "2.17.1", "fixed_version": "2.17.1", "fixed_candidates": ["2.17.1", "2.20.0"], "groupId": "org.apache.logging.log4j"},
-        "commons-text": {"cves": ["CVE-2022-42889"], "severity": "Critical", "vulnerable_below": "1.10.0", "fixed_version": "1.10.0", "fixed_candidates": ["1.10.0"], "groupId": "org.apache.commons"},
-        "jackson-databind": {"cves": ["CVE-2022-42003"], "severity": "Critical", "vulnerable_below": "2.14.0", "fixed_version": "2.14.0", "fixed_candidates": ["2.14.0", "2.15.0"], "groupId": "com.fasterxml.jackson.core"},
-        "snakeyaml": {"cves": ["CVE-2022-1471"], "severity": "Critical", "vulnerable_below": "1.32", "fixed_version": "1.33", "fixed_candidates": ["1.33", "2.0"], "groupId": "org.yaml"},
-        "commons-io": {"cves": ["CVE-2021-29425"], "severity": "High", "vulnerable_below": "2.7", "fixed_version": "2.7", "fixed_candidates": ["2.7", "2.11.0"], "groupId": "commons-io"},
-        "dom4j": {"cves": ["CVE-2020-10683"], "severity": "Critical", "vulnerable_below": "2.1.3", "fixed_version": "2.1.3", "fixed_candidates": ["2.1.3"], "groupId": "org.dom4j"},
-        "guava": {"cves": ["CVE-2020-8908"], "severity": "High", "vulnerable_below": "30.0-jre", "fixed_version": "30.0-jre", "fixed_candidates": ["30.0-jre", "32.0.0-jre"], "groupId": "com.google.guava"},
-        "xstream": {"cves": ["CVE-2021-21351"], "severity": "Critical", "vulnerable_below": "1.4.18", "fixed_version": "1.4.18", "fixed_candidates": ["1.4.18", "1.4.20"], "groupId": "com.thoughtworks.xstream"},
-        "commons-compress": {"cves": ["CVE-2021-35515"], "severity": "High", "vulnerable_below": "1.21", "fixed_version": "1.21", "fixed_candidates": ["1.21", "1.23.0"], "groupId": "org.apache.commons"},
-    }
-
-    try:
-        tree = ET.parse(pom_path)
-        root = tree.getroot()
-    except ET.ParseError:
-        return []
-
-    ns = ""
-    if root.tag.startswith("{"):
-        ns = root.tag.split("}")[0] + "}"
-
-    findings: list[dict[str, Any]] = []
-    for dep in root.iter(f"{ns}dependency"):
-        gid_el = dep.find(f"{ns}groupId")
-        aid_el = dep.find(f"{ns}artifactId")
-        ver_el = dep.find(f"{ns}version")
-        if gid_el is None or aid_el is None or ver_el is None:
+        if not vulns:
+            report_lines.append(f"  OK     [{pkg['ecosystem']}] {pkg['package']}@{pkg['version']}")
             continue
-        artifact_id = aid_el.text or ""
-        version = (ver_el.text or "").strip()
-        entry = JAVA_CVE_DB.get(artifact_id)
-        if entry and _is_vulnerable(version, entry):
+
+        for vuln_ref in vulns:
+            vuln_id = vuln_ref.get("id", "")
+            if not vuln_id or vuln_id in processed_vulns:
+                continue
+            # Only process once per (package, vuln) pair
+            pair_key = f"{pkg['package']}:{vuln_id}"
+            if pair_key in processed_vulns:
+                continue
+            processed_vulns.add(pair_key)
+
+            # Fetch full details
+            detail = _fetch_vuln_detail(vuln_id)
+            if not detail:
+                continue
+
+            severity = _extract_severity(detail)
+            fixed = _extract_fixed_version(detail, pkg["package"], pkg["ecosystem"])
+
+            # Check if this version is actually affected
+            is_affected = False
+            for aff in detail.get("affected", []):
+                pi = aff.get("package", {})
+                if pi.get("name", "").lower() == pkg["package"].lower() and pi.get("ecosystem") == pkg["ecosystem"]:
+                    if _is_affected(pkg["version"], aff):
+                        is_affected = True
+                        break
+
+            if not is_affected:
+                continue
+
+            summary = detail.get("summary", detail.get("details", "")[:100])
+            cve_aliases = [a for a in detail.get("aliases", []) if a.startswith("CVE")]
+            cve = cve_aliases[0] if cve_aliases else vuln_id
+
+            report_lines.append(f"  VULN   [{severity}] {pkg['package']}@{pkg['version']} -> {fixed or '?'} | {cve}")
+
+            # Determine groupId/artifactId
+            if pkg["ecosystem"] == "Maven":
+                parts = pkg["package"].split(":")
+                group_id = parts[0] if len(parts) == 2 else ""
+                artifact_id = parts[1] if len(parts) == 2 else pkg["package"]
+            else:
+                group_id = pkg["ecosystem"].lower()
+                artifact_id = pkg["package"]
+
             findings.append({
-                "severity": entry["severity"], "groupId": entry["groupId"], "artifactId": artifact_id,
-                "current_version": version, "fixed_version": entry["fixed_version"],
-                "fixed_candidates": entry.get("fixed_candidates", [entry["fixed_version"]]),
-                "cves": entry["cves"], "summary": f"{artifact_id} {version} -> {entry['fixed_version']}",
+                "severity": severity,
+                "groupId": group_id,
+                "artifactId": artifact_id,
+                "current_version": pkg["version"],
+                "fixed_version": fixed,
+                "fixed_candidates": [fixed] if fixed else [],
+                "cves": [cve],
+                "summary": f"{pkg['package']} {pkg['version']} -> {fixed or 'unknown'}: {summary[:80]}",
+                "service_dir": pkg.get("service_dir", ""),
+                "language": pkg.get("language", ""),
             })
-    return findings
+
+    # Build result
+    workspace = Path(workspace_url)
+    artifact_dir = workspace / ".adk_artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    report_path = artifact_dir / "scan_latest.txt"
+    report_text = "\n".join(report_lines + ["", f"TOTAL: {len(findings)} vulnerabilities found", "=" * 80])
+    report_path.write_text(report_text, encoding="utf-8")
+
+    return _build_result(findings, report_path, report_text, "+".join(set(d.get("language", "") for d in all_deps)) or "mixed", "osv")
 
 
 def _build_result(findings: list[dict], report_path: Path, report_text: str, language: str, backend: str) -> dict[str, Any]:
@@ -216,60 +450,26 @@ def _build_result(findings: list[dict], report_path: Path, report_text: str, lan
 def _build_remediation_targets(findings: list[dict]) -> list[dict]:
     aggregated: dict[tuple, dict] = {}
     for f in findings:
-        sev = f.get("severity")
-        if sev not in SEVERITY_PRIORITY:
-            continue
+        sev = f.get("severity", "Medium").upper()
+        sev_norm = SEVERITY_DISPLAY.get(sev, sev.title())
         key = (f["groupId"], f["artifactId"], f.get("current_version"))
         if key not in aggregated:
-            aggregated[key] = {"dependency": f["artifactId"] if f["groupId"] in ("pypi", "npm") else f"{f['groupId']}:{f['artifactId']}", "groupId": f["groupId"], "artifactId": f["artifactId"], "current_version": f.get("current_version"), "fixed_candidates": [], "highest_severity": sev, "cves": []}
+            dep_name = f["artifactId"] if f["groupId"] in ("pypi", "npm") else f"{f['groupId']}:{f['artifactId']}"
+            aggregated[key] = {"dependency": dep_name, "groupId": f["groupId"], "artifactId": f["artifactId"], "current_version": f.get("current_version"), "fixed_candidates": [], "highest_severity": sev_norm, "cves": []}
         t = aggregated[key]
-        if SEVERITY_PRIORITY[sev] < SEVERITY_PRIORITY.get(t["highest_severity"], 99):
-            t["highest_severity"] = sev
+        if SEVERITY_PRIORITY.get(sev, 99) < SEVERITY_PRIORITY.get(t["highest_severity"].upper(), 99):
+            t["highest_severity"] = sev_norm
         t["fixed_candidates"].extend(f.get("fixed_candidates", []))
         t["cves"] = sorted(set(t["cves"] + f.get("cves", [])))
+
     targets = []
     for t in aggregated.values():
-        candidates = sorted(set(t["fixed_candidates"]), key=_version_key)
-        targets.append({"dependency": t["dependency"], "groupId": t["groupId"], "artifactId": t["artifactId"], "current_version": t["current_version"], "fixed_version": candidates[0] if candidates else None, "fixed_candidates": candidates, "highest_severity": t["highest_severity"], "cves": t["cves"], "summary": f"{t['dependency']} {t['current_version'] or ''} -> {candidates[0] if candidates else 'unknown'}".strip()})
-    targets.sort(key=lambda x: (SEVERITY_PRIORITY.get(x.get("highest_severity"), 99), x["dependency"]))
+        candidates = sorted(set(filter(None, t["fixed_candidates"])), key=_version_key)
+        targets.append({
+            "dependency": t["dependency"], "groupId": t["groupId"], "artifactId": t["artifactId"],
+            "current_version": t["current_version"], "fixed_version": candidates[0] if candidates else None,
+            "fixed_candidates": candidates, "highest_severity": t["highest_severity"], "cves": t["cves"],
+            "summary": f"{t['dependency']} {t['current_version'] or ''} -> {candidates[0] if candidates else 'unknown'}".strip(),
+        })
+    targets.sort(key=lambda x: (SEVERITY_PRIORITY.get(x.get("highest_severity", "Medium").upper(), 99), x["dependency"]))
     return targets
-
-
-def scan_workspace_multi(workspace_url: str) -> dict[str, Any]:
-    """Scan a workspace — supports monorepos with multiple languages."""
-    services = _detect_all_services(workspace_url)
-
-    if not services:
-        workspace = Path(workspace_url)
-        artifact_dir = workspace / ".adk_artifacts"
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        report_path = artifact_dir / "scan_latest.txt"
-        report_path.write_text(f"No pom.xml, requirements.txt, or package.json found in {workspace_url}\n", encoding="utf-8")
-        return {"status": "error", "return_code": 1, "report_path": str(report_path), "report_size_chars": 0, "error": "No supported project files found", "vulnerabilities_found": False, "scan_execution_error": True, "scanner_backend": "static", "language": "unknown", "critical_vulnerabilities": 0, "high_vulnerabilities": 0, "medium_vulnerabilities": 0, "low_vulnerabilities": 0, "total_vulnerabilities": 0, "remediation_targets": [], "affected_dependencies": []}
-
-    # Scan each service and merge findings
-    all_findings: list[dict[str, Any]] = []
-    languages_found: list[str] = []
-    report_lines = ["=" * 80, "MULTI-LANGUAGE SCAN (Offline CVE Database)", "=" * 80, f"Workspace: {workspace_url}", f"Services: {len(services)}", ""]
-
-    for lang, svc_dir in services:
-        if lang == "java":
-            findings = _scan_java(str(svc_dir))
-        elif lang == "python":
-            findings = _scan_python(str(svc_dir))
-        elif lang == "nodejs":
-            findings = _scan_nodejs(str(svc_dir))
-        else:
-            continue
-        languages_found.append(lang)
-        all_findings.extend(findings)
-        report_lines.append(f"--- {lang} ({svc_dir.name}): {len(findings)} vulns ---")
-
-    workspace = Path(workspace_url)
-    artifact_dir = workspace / ".adk_artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    report_path = artifact_dir / "scan_latest.txt"
-    report_text = "\n".join(report_lines + ["", f"TOTAL: {len(all_findings)} vulnerabilities", "=" * 80])
-    report_path.write_text(report_text, encoding="utf-8")
-
-    return _build_result(all_findings, report_path, report_text, "+".join(languages_found) or "mixed", "static")
