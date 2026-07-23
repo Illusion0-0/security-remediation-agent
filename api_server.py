@@ -552,117 +552,44 @@ async def remediate_plan(request: PlanRequest) -> dict[str, Any]:
 
 @app.post("/remediate/apply")
 async def remediate_apply(request: ApplyRequest) -> dict[str, Any]:
+    """Apply version bumps directly (no LLM), run tests, create PR."""
+    from file_editor import apply_remediation
+    from test_runner import run_tests
+
     context = _ensure_workspace(request.repo_url, request.run_id)
     workspace_path = context.workspace_path
-    pom_path = Path(workspace_path) / "pom.xml"
-    pom_before_content = pom_path.read_text(encoding="utf-8", errors="replace") if pom_path.exists() else None
 
-    scan_state = await _invoke_agent(
-        app_name="java-vulnerability-scan",
-        agent=java_vulnerability_scanner_agent,
-        state={"workspace_url": workspace_path, "run_id": request.run_id, "repo_url": request.repo_url},
-        message=(
-            "Run vulnerability scan for this workspace and return strict JSON only. "
-            f"workspace_url={workspace_path}."
-        ),
-    )
-    vulnerability_scan_report = _coerce_dict(scan_state.get("vulnerability_scan_report"))
-    if not vulnerability_scan_report:
-        vulnerability_scan_report = _coerce_dict(scan_state.get("__last_function_response"))
-    if not vulnerability_scan_report:
-        vulnerability_scan_report = _coerce_dict(scan_state.get("__last_text_json"))
-    if vulnerability_scan_report.get("scan_execution_error"):
-        raise HTTPException(status_code=502, detail=vulnerability_scan_report.get("error") or "JFrog scan execution failed")
-    if (
-        vulnerability_scan_report.get("return_code") not in (None, 0)
-        and vulnerability_scan_report.get("total_vulnerabilities", 0) == 0
-    ):
-        raise HTTPException(
-            status_code=502,
-            detail=vulnerability_scan_report.get("error") or "JFrog scan failed before producing findings",
-        )
+    # Step 1: Apply version bumps directly (no AI needed)
+    edit_result = apply_remediation(workspace_path, request.proposals)
+    changes = edit_result.get("changes", [])
+    changed_files = edit_result.get("changed_files", [])
 
-    fix_state = await _invoke_agent(
-        app_name="java-vulnerability-fix",
-        agent=java_vulnerability_fixer_agent,
-        state={
-            "workspace_url": workspace_path,
-            "run_id": request.run_id,
-            "repo_url": request.repo_url,
-            "vulnerability_scan_report": vulnerability_scan_report,
-            "approved_proposals": request.proposals,
-        },
-        message=(
-            "Apply only the approved dependency remediation proposals in this workspace and return strict JSON only. "
-            "Use approved_proposals from session state as the primary source of truth for versions to apply. "
-            f"workspace_url={workspace_path}."
-        ),
-    )
-    remediation_result = _coerce_dict(fix_state.get("remediation_result"))
-    if not remediation_result:
-        remediation_result = _coerce_dict(fix_state.get("__last_function_response"))
-    if not remediation_result:
-        remediation_result = _coerce_dict(fix_state.get("__last_text_json"))
-    if not remediation_result:
-        raise HTTPException(status_code=502, detail="Fixer ADK agent returned no structured output")
-
-    sanitize_result = _sanitize_pom_with_approved_proposals(
-        workspace_path=workspace_path,
-        pom_before_content=pom_before_content,
-        proposals=request.proposals,
-    )
-    if sanitize_result.get("status") == "error":
-        raise HTTPException(status_code=502, detail=sanitize_result.get("error") or "Failed to enforce approved proposals")
-    if sanitize_result.get("updated_dependencies"):
-        remediation_result["updated_dependencies"] = sanitize_result.get("updated_dependencies", [])
-    remediation_result["proposal_guard"] = {
-        "enforced": bool(sanitize_result.get("enforced")),
-        "status": sanitize_result.get("status"),
-        "reason": sanitize_result.get("reason"),
-        "accepted_count": sanitize_result.get("accepted_count", 0),
-        "rejected_count": sanitize_result.get("rejected_count", 0),
-    }
-    if sanitize_result.get("accepted_proposals"):
-        remediation_result["accepted_proposals"] = sanitize_result.get("accepted_proposals")
-    if sanitize_result.get("rejected_proposals"):
-        remediation_result["rejected_proposals"] = sanitize_result.get("rejected_proposals")
-
-    default_pom = str(Path(workspace_path) / "pom.xml")
-    updated_dependencies = remediation_result.get("updated_dependencies") or remediation_result.get("dependencies_changed") or []
-    changed_files = sorted(
-        {
-            item.get("file_path")
-            for item in updated_dependencies
-            if item.get("file_path") and not str(item.get("file_path")).startswith(".adk_artifacts")
-        }
-    )
     if not changed_files:
         changed_files = _git_changed_files(workspace_path)
     if not changed_files:
-        changed_files = [default_pom]
+        changed_files = ["pom.xml"]
 
-    changes: list[dict[str, Any]] = _map_updated_dependencies(updated_dependencies, default_pom)
-    if not changes:
-        changes = _build_dependency_changes_from_proposals(request.proposals, changed_files)
-    if not changes:
-        changes = _build_dependency_changes_from_targets(
-            remediation_result.get("remediation_targets", [])
-            or vulnerability_scan_report.get("remediation_targets", []),
-            changed_files,
-        )
+    # Step 2: Run tests to validate fixes
+    test_results = run_tests(workspace_path)
 
+    # Step 3: Create GitHub PR (direct API, no AI)
+    pr_result = _maybe_create_github_pr(
+        repo_url=request.repo_url, workspace_path=workspace_path,
+        changed_files=changed_files, changes=changes,
+        run_id=request.run_id, findings_count=len(request.proposals),
+    )
 
     return {
         "workspace_path": workspace_path,
         "changed_files": changed_files,
         "changes": changes,
         "diff_excerpt": _diff_excerpt(workspace_path),
-        "remediation_result": remediation_result,
-        "pull_request": _maybe_create_github_pr(
-            repo_url=request.repo_url, workspace_path=workspace_path,
-            changed_files=changed_files, changes=changes,
-            run_id=request.run_id, findings_count=len(request.proposals),
-        ),
+        "remediation_result": {
+            "status": edit_result.get("status"),
+            "updated_count": edit_result.get("updated_count", 0),
+            "test_results": test_results,
+        },
+        "pull_request": pr_result,
     }
 
 
