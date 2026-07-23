@@ -1,6 +1,4 @@
-    test_results = check_breaking_changes(workspace_path, changed_files, request.proposals)
-    test_results = check_breaking_changes(workspace_path, changed_files, request.proposals)
-import subprocess
+﻿import subprocess
 import os
 import json
 import logging
